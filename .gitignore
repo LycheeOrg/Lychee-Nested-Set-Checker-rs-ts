@@ -1,0 +1,15 @@
+# Rust
+/rust/target/
+/rust/pkg/
+/rust/pkg-*/
+**/*.rs.bk
+
+# Node (examples / tooling, if ever added)
+node_modules/
+npm-debug.log*
+
+# Editors / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

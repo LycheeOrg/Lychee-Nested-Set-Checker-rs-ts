@@ -1,0 +1,74 @@
+name: Publish to npm
+
+# Triggers when a GitHub Release is published (e.g. tag v1.2.3).
+# Set NPM_TOKEN in Settings → Secrets → Actions before the first publish.
+on:
+  release:
+    types: [published]
+
+permissions: read-all
+
+jobs:
+  publish:
+    name: Build & publish
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write   # required for npm provenance attestation
+
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@bf7454d06d71f1098171f2acdf0cd4708d7b5920 # v2.20.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workdir: rust
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      # ── Node.js ─────────────────────────────────────────────────────────────
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      # ── Build ───────────────────────────────────────────────────────────────
+
+      - name: Build WASM package
+        run: wasm-pack build --target web --out-dir pkg --release --scope lychee-org
+        working-directory: rust
+
+      - name: Run Node smoke test against the built package
+        run: node test/smoke.mjs
+        working-directory: rust
+
+      # ── Version ─────────────────────────────────────────────────────────────
+
+      - name: Stamp version from release tag
+        # Release tag is e.g. "v1.2.3"; npm version must be "1.2.3".
+        run: npm pkg set version="${GITHUB_REF_NAME#v}"
+        working-directory: rust/pkg
+
+      # ── Publish ─────────────────────────────────────────────────────────────
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        working-directory: rust/pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

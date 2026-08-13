@@ -1,0 +1,34 @@
+[package]
+name = "nested-set-checker-wasm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["LycheeOrg"]
+description = "WebAssembly bindings for validating and repairing Lychee's nested-set (modified preorder tree traversal) album trees"
+homepage = "https://github.com/LycheeOrg/Lychee-Nested-Set-Checker-rs-ts"
+repository = "https://github.com/LycheeOrg/Lychee-Nested-Set-Checker-rs-ts"
+license = "MIT"
+keywords = ["nested-set", "wasm", "tree", "mptt"]
+categories = ["wasm", "data-structures"]
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Os"]
