@@ -30,8 +30,8 @@ const validTree = () => ({
 	id: ['root', 'child-a', 'child-b'],
 	title: ['root', 'child-a', 'child-b'],
 	parent_id: [null, 'root', 'root'],
-	lft: Int32Array.from([1, 2, 4]),
-	rgt: Int32Array.from([6, 3, 5]),
+	_lft: Int32Array.from([1, 2, 4]),
+	_rgt: Int32Array.from([6, 3, 5]),
 });
 
 const indexOf = (tree, id) => tree.id.indexOf(id);
@@ -46,20 +46,20 @@ const indexOf = (tree, id) => tree.id.indexOf(id);
 	assert.equal(result.albums.trimmedId[0], 'root');
 }
 
-// Duplicate lft is detected and classified.
+// Duplicate _lft is detected and classified.
 {
 	const tree = validTree();
-	tree.lft[2] = 2; // collides with child-a's lft
+	tree._lft[2] = 2; // collides with child-a's _lft
 	const result = prepareAlbums(tree);
 	assert.equal(result.isValid, false);
 	assert.ok(result.errors.some((e) => e.kind === 'duplicate_left' || e.kind === 'duplicate_right'));
 }
 
-// 0 lft or rgt is detected (the "missing" sentinel).
+// 0 _lft or _rgt is detected (the "missing" sentinel).
 {
 	const tree = validTree();
-	tree.lft[1] = 0;
-	tree.rgt[2] = 0;
+	tree._lft[1] = 0;
+	tree._rgt[2] = 0;
 	const result = prepareAlbums(tree);
 	const kinds = result.errors.map((e) => e.kind);
 	assert.ok(kinds.includes('invalid_left'));
@@ -74,16 +74,16 @@ const indexOf = (tree, id) => tree.id.indexOf(id);
 	assert.ok(result.errors.some((e) => e.kind === 'parent'));
 }
 
-// incrementLft shifts only rows whose lft is >= the target's lft; root's
-// lft (1) is below the threshold (4), so it's untouched even though its
-// rgt (6) is not.
+// incrementLft shifts only rows whose _lft is >= the target's _lft; root's
+// _lft (1) is below the threshold (4), so it's untouched even though its
+// _rgt (6) is not.
 {
 	const { albums } = prepareAlbums(validTree());
 	const shifted = incrementLft(albums, 'child-b');
-	assert.equal(shifted.lft[indexOf(shifted, 'root')], 1);
-	assert.equal(shifted.rgt[indexOf(shifted, 'root')], 6);
-	assert.equal(shifted.lft[indexOf(shifted, 'child-b')], 5);
-	assert.equal(shifted.rgt[indexOf(shifted, 'child-b')], 6);
+	assert.equal(shifted._lft[indexOf(shifted, 'root')], 1);
+	assert.equal(shifted._rgt[indexOf(shifted, 'root')], 6);
+	assert.equal(shifted._lft[indexOf(shifted, 'child-b')], 5);
+	assert.equal(shifted._rgt[indexOf(shifted, 'child-b')], 6);
 }
 
 // decrementLft is the inverse of incrementLft.
@@ -91,19 +91,19 @@ const indexOf = (tree, id) => tree.id.indexOf(id);
 	const { albums } = prepareAlbums(validTree());
 	const shifted = incrementLft(albums, 'child-b');
 	const restored = decrementLft(shifted, 'child-b');
-	assert.equal(restored.lft[indexOf(restored, 'root')], 1);
-	assert.equal(restored.rgt[indexOf(restored, 'root')], 6);
-	assert.equal(restored.lft[indexOf(restored, 'child-b')], 4);
-	assert.equal(restored.rgt[indexOf(restored, 'child-b')], 5);
+	assert.equal(restored._lft[indexOf(restored, 'root')], 1);
+	assert.equal(restored._rgt[indexOf(restored, 'root')], 6);
+	assert.equal(restored._lft[indexOf(restored, 'child-b')], 4);
+	assert.equal(restored._rgt[indexOf(restored, 'child-b')], 5);
 }
 
 // incrementRgt / decrementRgt round-trip through the boundary case.
 {
 	const { albums } = prepareAlbums(validTree());
 	const widened = incrementRgt(albums, 'child-a');
-	assert.equal(widened.lft[indexOf(widened, 'child-a')], 2);
-	assert.equal(widened.rgt[indexOf(widened, 'child-a')], 4);
-	assert.equal(widened.rgt[indexOf(widened, 'root')], 7);
+	assert.equal(widened._lft[indexOf(widened, 'child-a')], 2);
+	assert.equal(widened._rgt[indexOf(widened, 'child-a')], 4);
+	assert.equal(widened._rgt[indexOf(widened, 'root')], 7);
 }
 
 // An id that doesn't exist leaves the arrays untouched rather than throwing.
@@ -111,22 +111,22 @@ const indexOf = (tree, id) => tree.id.indexOf(id);
 	const { albums } = prepareAlbums(validTree());
 	assert.doesNotThrow(() => incrementLft(albums, 'does-not-exist'));
 	const untouched = incrementLft(albums, 'does-not-exist');
-	assert.deepEqual(Array.from(untouched.lft), Array.from(albums.lft));
-	assert.deepEqual(Array.from(untouched.rgt), Array.from(albums.rgt));
+	assert.deepEqual(Array.from(untouched._lft), Array.from(albums._lft));
+	assert.deepEqual(Array.from(untouched._rgt), Array.from(albums._rgt));
 }
 
-// getModifiedAlbums reports only rows whose lft/rgt/parent_id changed, plus
+// getModifiedAlbums reports only rows whose _lft/_rgt/parent_id changed, plus
 // any row that's new.
 {
 	const original = validTree();
 	const current = validTree();
-	current.lft[1] = 20;
-	current.rgt[1] = 21;
+	current._lft[1] = 20;
+	current._rgt[1] = 21;
 	current.id = [...current.id, 'child-c'];
 	current.title = [...current.title, 'child-c'];
 	current.parent_id = [...current.parent_id, 'root'];
-	current.lft = Int32Array.from([...current.lft, 30]);
-	current.rgt = Int32Array.from([...current.rgt, 31]);
+	current._lft = Int32Array.from([...current._lft, 30]);
+	current._rgt = Int32Array.from([...current._rgt, 31]);
 
 	const modified = getModifiedAlbums(current, original);
 	const ids = Array.from(modified.id).sort();

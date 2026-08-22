@@ -2,7 +2,7 @@
 //! preorder tree traversal) album trees, as used by [Lychee](https://github.com/LycheeOrg/Lychee).
 //!
 //! This is a Wasm port of the pure tree/array logic from Lychee's
-//! `useTreeOperations` Vue composable: duplicate `lft`/`rgt` detection, the
+//! `useTreeOperations` Vue composable: duplicate `_lft`/`_rgt` detection, the
 //! parent-stack ("pile") walk that flags rows with an unexpected `parent_id`,
 //! error classification, the four MPTT repair operations, and diffing against
 //! a baseline. Vue reactivity, i18n string lookup and toast notifications stay
@@ -10,11 +10,11 @@
 //! decisions, it doesn't render or translate anything.
 //!
 //! v2 note: the public API is struct-of-arrays rather than array-of-structs.
-//! A tree is one object holding parallel `id`/`title`/`parent_id`/`lft`/`rgt`
+//! A tree is one object holding parallel `id`/`title`/`parent_id`/`_lft`/`_rgt`
 //! arrays (all the same length) instead of an array of per-row objects.
-//! `lft`/`rgt` cross the Wasm boundary as real `Int32Array`s and the boolean
+//! `_lft`/`_rgt` cross the Wasm boundary as real `Int32Array`s and the boolean
 //! per-row flags as `Uint8Array`s (0/1), avoiding a boxed JS value per cell.
-//! `lft`/`rgt` are non-nullable; `0` is the "missing/invalid" sentinel
+//! `_lft`/`_rgt` are non-nullable; `0` is the "missing/invalid" sentinel
 //! (mirrors how v1 already treated `null` and `0` identically).
 
 use serde::Serialize;
@@ -31,15 +31,15 @@ pub fn set_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-/// Struct-of-arrays tree: `id[i]`/`title[i]`/`parent_id[i]`/`lft[i]`/`rgt[i]`
+/// Struct-of-arrays tree: `id[i]`/`title[i]`/`parent_id[i]`/`_lft[i]`/`_rgt[i]`
 /// together describe row `i`. All fields must have the same length.
 #[derive(Debug, Clone)]
 struct AlbumTree {
     id: Vec<String>,
     title: Vec<String>,
     parent_id: Vec<Option<String>>,
-    lft: Vec<i32>,
-    rgt: Vec<i32>,
+    _lft: Vec<i32>,
+    _rgt: Vec<i32>,
 }
 
 /// `AlbumTree` plus the per-row fields `prepareAlbums` computes.
@@ -57,8 +57,8 @@ struct AugmentedAlbumTree {
 /// Diff output of `getModifiedAlbums`: the changed (or newly added) rows only.
 struct ModifiedAlbums {
     id: Vec<String>,
-    lft: Vec<i32>,
-    rgt: Vec<i32>,
+    _lft: Vec<i32>,
+    _rgt: Vec<i32>,
     parent_id: Vec<Option<String>>,
 }
 
@@ -77,6 +77,9 @@ enum ErrorKind {
     Unknown,
 }
 
+/// Note: unlike `AlbumTree`/`ModifiedAlbums`, `lft`/`rgt` here are bare (no
+/// leading underscore) — these are translation-interpolation args for the UI
+/// message, not the DB-shaped tree fields, mirroring the original composable.
 #[derive(Debug, Clone, Serialize)]
 struct ErrorDescriptor {
     #[serde(rename = "trimmedId")]
@@ -109,8 +112,8 @@ struct PileEntry {
 
 // --- JS <-> Rust boundary helpers -----------------------------------------
 //
-// The public contract (see `TS_APPEND_CONTENT` below) declares `lft`/`rgt` as
-// `Int32Array` and the boolean flags as `Uint8Array` so real typed arrays
+// The public contract (see `TS_APPEND_CONTENT` below) declares `_lft`/`_rgt`
+// as `Int32Array` and the boolean flags as `Uint8Array` so real typed arrays
 // cross the boundary instead of a JS array of boxed values. Parsing also
 // accepts a plain `number[]`/`boolean[]` as a defensive fallback.
 
@@ -205,11 +208,11 @@ fn album_tree_from_js(source: &JsValue) -> Result<AlbumTree, JsValue> {
     let id = parse_string_vec(source, "id")?;
     let title = parse_string_vec(source, "title")?;
     let parent_id = parse_opt_string_vec(source, "parent_id")?;
-    let lft = parse_i32_vec(source, "lft")?;
-    let rgt = parse_i32_vec(source, "rgt")?;
+    let _lft = parse_i32_vec(source, "_lft")?;
+    let _rgt = parse_i32_vec(source, "_rgt")?;
 
     let len = id.len();
-    if title.len() != len || parent_id.len() != len || lft.len() != len || rgt.len() != len {
+    if title.len() != len || parent_id.len() != len || _lft.len() != len || _rgt.len() != len {
         return Err(JsValue::from_str(
             "AlbumTree arrays must all have the same length",
         ));
@@ -219,8 +222,8 @@ fn album_tree_from_js(source: &JsValue) -> Result<AlbumTree, JsValue> {
         id,
         title,
         parent_id,
-        lft,
-        rgt,
+        _lft,
+        _rgt,
     })
 }
 
@@ -263,8 +266,8 @@ fn album_tree_object(tree: &AlbumTree) -> Result<js_sys::Object, JsValue> {
     set_prop(&obj, "id", &to_string_array(&tree.id))?;
     set_prop(&obj, "title", &to_string_array(&tree.title))?;
     set_prop(&obj, "parent_id", &to_opt_string_array(&tree.parent_id))?;
-    set_prop(&obj, "lft", &to_i32_array(&tree.lft))?;
-    set_prop(&obj, "rgt", &to_i32_array(&tree.rgt))?;
+    set_prop(&obj, "_lft", &to_i32_array(&tree._lft))?;
+    set_prop(&obj, "_rgt", &to_i32_array(&tree._rgt))?;
     Ok(obj)
 }
 
@@ -302,16 +305,16 @@ fn prepare_result_to_js(result: &PrepareResult) -> Result<JsValue, JsValue> {
 fn modified_albums_to_js(m: &ModifiedAlbums) -> Result<JsValue, JsValue> {
     let obj = js_sys::Object::new();
     set_prop(&obj, "id", &to_string_array(&m.id))?;
-    set_prop(&obj, "lft", &to_i32_array(&m.lft))?;
-    set_prop(&obj, "rgt", &to_i32_array(&m.rgt))?;
+    set_prop(&obj, "_lft", &to_i32_array(&m._lft))?;
+    set_prop(&obj, "_rgt", &to_i32_array(&m._rgt))?;
     set_prop(&obj, "parent_id", &to_opt_string_array(&m.parent_id))?;
     Ok(obj.into())
 }
 
 // --- Pure tree/array logic (no JS types below this point) -----------------
 
-/// A value is a duplicate if it appears more than once as either `lft` or
-/// `rgt` across all rows (mirrors `buildDuplicateSets` in the TS source).
+/// A value is a duplicate if it appears more than once as either `_lft` or
+/// `_rgt` across all rows (mirrors `buildDuplicateSets` in the TS source).
 fn build_duplicate_sets(lft: &[i32], rgt: &[i32]) -> (HashSet<i32>, HashSet<i32>) {
     let mut lft_counts: HashMap<i32, u32> = HashMap::new();
     let mut rgt_counts: HashMap<i32, u32> = HashMap::new();
@@ -367,7 +370,7 @@ fn classify_error(
 
 fn prepare_albums_impl(tree: AlbumTree) -> PrepareResult {
     let len = tree.id.len();
-    let (duplicate_lfts, duplicate_rgts) = build_duplicate_sets(&tree.lft, &tree.rgt);
+    let (duplicate_lfts, duplicate_rgts) = build_duplicate_sets(&tree._lft, &tree._rgt);
 
     let mut prefix = Vec::with_capacity(len);
     let mut trimmed_id = Vec::with_capacity(len);
@@ -382,13 +385,13 @@ fn prepare_albums_impl(tree: AlbumTree) -> PrepareResult {
     for i in 0..len {
         let row_trimmed_id = trim6(&tree.id[i]);
         let row_trimmed_parent_id = trim6(tree.parent_id[i].as_deref().unwrap_or("root"));
-        let row_is_duplicate_lft = duplicate_lfts.contains(&tree.lft[i]);
-        let row_is_duplicate_rgt = duplicate_rgts.contains(&tree.rgt[i]);
+        let row_is_duplicate_lft = duplicate_lfts.contains(&tree._lft[i]);
+        let row_is_duplicate_rgt = duplicate_rgts.contains(&tree._rgt[i]);
 
         // If current lft/rgt is greater than the last pile entry's rgt, we're
         // no longer inside it: pop until we're back inside the enclosing row.
         while let Some(top) = pile.last() {
-            if tree.lft[i] > top.rgt || tree.rgt[i] > top.rgt {
+            if tree._lft[i] > top.rgt || tree._rgt[i] > top.rgt {
                 pile.pop();
             } else {
                 break;
@@ -402,16 +405,16 @@ fn prepare_albums_impl(tree: AlbumTree) -> PrepareResult {
 
         prefix.push("  │ ".repeat(pile.len()));
 
-        let is_parent = tree.rgt[i] > tree.lft[i] + 1;
+        let is_parent = tree._rgt[i] > tree._lft[i] + 1;
         if is_parent {
             pile.push(PileEntry {
                 parent_id: Some(tree.id[i].clone()),
-                rgt: tree.rgt[i],
+                rgt: tree._rgt[i],
             });
         }
 
-        if tree.lft[i] == 0
-            || tree.rgt[i] == 0
+        if tree._lft[i] == 0
+            || tree._rgt[i] == 0
             || row_is_duplicate_lft
             || row_is_duplicate_rgt
             || !row_is_expected_parent_id
@@ -419,14 +422,14 @@ fn prepare_albums_impl(tree: AlbumTree) -> PrepareResult {
             errors.push(ErrorDescriptor {
                 trimmed_id: row_trimmed_id.clone(),
                 kind: classify_error(
-                    tree.lft[i],
-                    tree.rgt[i],
+                    tree._lft[i],
+                    tree._rgt[i],
                     row_is_duplicate_lft,
                     row_is_duplicate_rgt,
                     row_is_expected_parent_id,
                 ),
-                lft: tree.lft[i],
-                rgt: tree.rgt[i],
+                lft: tree._lft[i],
+                rgt: tree._rgt[i],
                 parent_id: tree.parent_id[i].clone(),
             });
         }
@@ -460,14 +463,14 @@ fn increment_lft_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbu
     let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
-    let lft = albums.base.lft[idx];
+    let lft = albums.base._lft[idx];
 
     for i in 0..albums.base.id.len() {
-        if albums.base.lft[i] < lft {
+        if albums.base._lft[i] < lft {
             continue;
         }
-        albums.base.lft[i] += 1;
-        albums.base.rgt[i] += 1;
+        albums.base._lft[i] += 1;
+        albums.base._rgt[i] += 1;
     }
     albums
 }
@@ -477,18 +480,18 @@ fn increment_rgt_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbu
     let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
-    let rgt = albums.base.rgt[idx];
+    let rgt = albums.base._rgt[idx];
 
     for i in 0..albums.base.id.len() {
-        let a_rgt = albums.base.rgt[i];
+        let a_rgt = albums.base._rgt[i];
         if a_rgt < rgt {
             continue;
         }
         if a_rgt == rgt {
-            albums.base.rgt[i] += 1;
+            albums.base._rgt[i] += 1;
         } else {
-            albums.base.lft[i] += 1;
-            albums.base.rgt[i] += 1;
+            albums.base._lft[i] += 1;
+            albums.base._rgt[i] += 1;
         }
     }
     albums
@@ -499,14 +502,14 @@ fn decrement_lft_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbu
     let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
-    let lft = albums.base.lft[idx];
+    let lft = albums.base._lft[idx];
 
     for i in 0..albums.base.id.len() {
-        if albums.base.lft[i] < lft {
+        if albums.base._lft[i] < lft {
             continue;
         }
-        albums.base.lft[i] -= 1;
-        albums.base.rgt[i] -= 1;
+        albums.base._lft[i] -= 1;
+        albums.base._rgt[i] -= 1;
     }
     albums
 }
@@ -516,26 +519,26 @@ fn decrement_rgt_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbu
     let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
-    let rgt = albums.base.rgt[idx];
+    let rgt = albums.base._rgt[idx];
 
     for i in 0..albums.base.id.len() {
-        let a_rgt = albums.base.rgt[i];
+        let a_rgt = albums.base._rgt[i];
         if a_rgt < rgt {
             continue;
         }
         // safety check
-        if albums.base.lft[i] == rgt - 1 {
+        if albums.base._lft[i] == rgt - 1 {
             continue;
         }
         if a_rgt == rgt {
-            albums.base.rgt[i] -= 1;
+            albums.base._rgt[i] -= 1;
         } else {
             // Mirrors the upstream TS composable's `decrementRgt` verbatim,
             // including its else-branch incrementing rather than
             // decrementing (matching `incrementRgt`'s else-branch). This is
             // a faithful port, not a bugfix — flagged for upstream review.
-            albums.base.lft[i] += 1;
-            albums.base.rgt[i] += 1;
+            albums.base._lft[i] += 1;
+            albums.base._rgt[i] += 1;
         }
     }
     albums
@@ -549,8 +552,8 @@ fn get_modified_albums_impl(current: AlbumTree, original: AlbumTree) -> Modified
 
     let mut result = ModifiedAlbums {
         id: Vec::new(),
-        lft: Vec::new(),
-        rgt: Vec::new(),
+        _lft: Vec::new(),
+        _rgt: Vec::new(),
         parent_id: Vec::new(),
     };
 
@@ -558,16 +561,16 @@ fn get_modified_albums_impl(current: AlbumTree, original: AlbumTree) -> Modified
         let changed = match original_index.get(current.id[i].as_str()) {
             None => true,
             Some(&oi) => {
-                current.lft[i] != original.lft[oi]
-                    || current.rgt[i] != original.rgt[oi]
+                current._lft[i] != original._lft[oi]
+                    || current._rgt[i] != original._rgt[oi]
                     || current.parent_id[i] != original.parent_id[oi]
             }
         };
 
         if changed {
             result.id.push(current.id[i].clone());
-            result.lft.push(current.lft[i]);
-            result.rgt.push(current.rgt[i]);
+            result._lft.push(current._lft[i]);
+            result._rgt.push(current._rgt[i]);
             result.parent_id.push(current.parent_id[i].clone());
         }
     }
@@ -581,8 +584,8 @@ export interface AlbumTree {
     id: string[];
     title: string[];
     parent_id: (string | null)[];
-    lft: Int32Array;
-    rgt: Int32Array;
+    _lft: Int32Array;
+    _rgt: Int32Array;
 }
 
 export interface Augmented {
@@ -626,16 +629,16 @@ export interface PrepareResult {
 
 export interface ModifiedAlbums {
     id: string[];
-    lft: Int32Array;
-    rgt: Int32Array;
+    _lft: Int32Array;
+    _rgt: Int32Array;
     parent_id: (string | null)[];
 }
 "#;
 
-/// Validates a tree: builds duplicate `lft`/`rgt` sets, walks the tree in
-/// `lft` order tracking a parent stack to flag rows with an unexpected
+/// Validates a tree: builds duplicate `_lft`/`_rgt` sets, walks the tree in
+/// `_lft` order tracking a parent stack to flag rows with an unexpected
 /// `parent_id`, and classifies every row that fails validation. `source`
-/// should already be sorted by `lft` (the original composable relies on the
+/// should already be sorted by `_lft` (the original composable relies on the
 /// same precondition), and all of its arrays must have the same length.
 #[wasm_bindgen(js_name = prepareAlbums, unchecked_return_type = "PrepareResult")]
 pub fn prepare_albums(
@@ -646,7 +649,7 @@ pub fn prepare_albums(
     prepare_result_to_js(&result)
 }
 
-/// Shifts every row whose `lft` is `>= id`'s `lft` up by one, making room to
+/// Shifts every row whose `_lft` is `>= id`'s `_lft` up by one, making room to
 /// insert immediately before it.
 #[wasm_bindgen(js_name = incrementLft, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn increment_lft(
@@ -657,7 +660,7 @@ pub fn increment_lft(
     augmented_object(&increment_lft_impl(albums, id))
 }
 
-/// Shifts every row whose `rgt` is `>= id`'s `rgt` up by one, making room to
+/// Shifts every row whose `_rgt` is `>= id`'s `_rgt` up by one, making room to
 /// insert immediately after it (as a sibling) or as its first child.
 #[wasm_bindgen(js_name = incrementRgt, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn increment_rgt(
@@ -669,7 +672,7 @@ pub fn increment_rgt(
 }
 
 /// Inverse of [`increment_lft`]: closes the gap left by removing a row at
-/// `id`'s `lft`.
+/// `id`'s `_lft`.
 #[wasm_bindgen(js_name = decrementLft, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn decrement_lft(
     #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
@@ -680,7 +683,7 @@ pub fn decrement_lft(
 }
 
 /// Inverse of [`increment_rgt`]: closes the gap left by removing a row at
-/// `id`'s `rgt`, unless the safety check (`lft === rgt - 1`) trips.
+/// `id`'s `_rgt`, unless the safety check (`_lft === _rgt - 1`) trips.
 #[wasm_bindgen(js_name = decrementRgt, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn decrement_rgt(
     #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
@@ -691,8 +694,8 @@ pub fn decrement_rgt(
 }
 
 /// Diffs `current` against `original` by id, returning only the rows whose
-/// `lft`, `rgt` or `parent_id` changed (plus any row in `current` that isn't
-/// in `original` at all, i.e. newly added).
+/// `_lft`, `_rgt` or `parent_id` changed (plus any row in `current` that
+/// isn't in `original` at all, i.e. newly added).
 #[wasm_bindgen(js_name = getModifiedAlbums, unchecked_return_type = "ModifiedAlbums")]
 pub fn get_modified_albums(
     #[wasm_bindgen(unchecked_param_type = "AlbumTree")] current: JsValue,
@@ -713,8 +716,8 @@ mod tests {
             id: vec!["root".into(), "child-a".into(), "child-b".into()],
             title: vec!["root".into(), "child-a".into(), "child-b".into()],
             parent_id: vec![None, Some("root".into()), Some("root".into())],
-            lft: vec![1, 2, 4],
-            rgt: vec![6, 3, 5],
+            _lft: vec![1, 2, 4],
+            _rgt: vec![6, 3, 5],
         }
     }
 
@@ -734,7 +737,7 @@ mod tests {
     #[test]
     fn detects_duplicate_lft_and_rgt() {
         let mut tree = valid_tree();
-        tree.lft[2] = 2; // now collides with child-a's lft
+        tree._lft[2] = 2; // now collides with child-a's _lft
         let result = prepare_albums_impl(tree);
         assert!(!result.is_valid);
         assert!(result
@@ -746,8 +749,8 @@ mod tests {
     #[test]
     fn detects_zero_lft_rgt() {
         let mut tree = valid_tree();
-        tree.lft[1] = 0;
-        tree.rgt[2] = 0;
+        tree._lft[1] = 0;
+        tree._rgt[2] = 0;
         let result = prepare_albums_impl(tree);
         assert!(!result.is_valid);
         let kinds: Vec<_> = result.errors.iter().map(|e| e.kind).collect();
@@ -758,8 +761,8 @@ mod tests {
     #[test]
     fn detects_lft_gte_rgt() {
         let mut tree = valid_tree();
-        tree.lft[1] = 3;
-        tree.rgt[1] = 3;
+        tree._lft[1] = 3;
+        tree._rgt[1] = 3;
         let result = prepare_albums_impl(tree);
         assert!(result
             .errors
@@ -779,24 +782,24 @@ mod tests {
     fn increment_lft_shifts_everything_at_or_after() {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_lft_impl(result.albums, "child-b");
-        // Only rows whose lft >= 4 move; root's lft is 1, so it (and its
-        // rgt) is left untouched even though 6 >= 4.
-        assert_eq!(shifted.base.lft[index_of(&shifted, "root")], 1);
-        assert_eq!(shifted.base.rgt[index_of(&shifted, "root")], 6);
-        assert_eq!(shifted.base.lft[index_of(&shifted, "child-a")], 2);
-        assert_eq!(shifted.base.lft[index_of(&shifted, "child-b")], 5);
-        assert_eq!(shifted.base.rgt[index_of(&shifted, "child-b")], 6);
+        // Only rows whose _lft >= 4 move; root's _lft is 1, so it (and its
+        // _rgt) is left untouched even though 6 >= 4.
+        assert_eq!(shifted.base._lft[index_of(&shifted, "root")], 1);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "root")], 6);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-a")], 2);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-b")], 5);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-b")], 6);
     }
 
     #[test]
     fn increment_rgt_widens_the_target_only_at_boundary() {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_rgt_impl(result.albums, "child-a");
-        assert_eq!(shifted.base.rgt[index_of(&shifted, "child-a")], 4);
-        assert_eq!(shifted.base.lft[index_of(&shifted, "child-a")], 2); // exact rgt match: only rgt moves
-        assert_eq!(shifted.base.lft[index_of(&shifted, "child-b")], 5);
-        assert_eq!(shifted.base.rgt[index_of(&shifted, "child-b")], 6);
-        assert_eq!(shifted.base.rgt[index_of(&shifted, "root")], 7);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-a")], 4);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-a")], 2); // exact rgt match: only rgt moves
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-b")], 5);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-b")], 6);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "root")], 7);
     }
 
     #[test]
@@ -804,10 +807,10 @@ mod tests {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_lft_impl(result.albums, "child-b");
         let restored = decrement_lft_impl(shifted, "child-b");
-        assert_eq!(restored.base.lft[index_of(&restored, "root")], 1);
-        assert_eq!(restored.base.rgt[index_of(&restored, "root")], 6);
-        assert_eq!(restored.base.lft[index_of(&restored, "child-b")], 4);
-        assert_eq!(restored.base.rgt[index_of(&restored, "child-b")], 5);
+        assert_eq!(restored.base._lft[index_of(&restored, "root")], 1);
+        assert_eq!(restored.base._rgt[index_of(&restored, "root")], 6);
+        assert_eq!(restored.base._lft[index_of(&restored, "child-b")], 4);
+        assert_eq!(restored.base._rgt[index_of(&restored, "child-b")], 5);
     }
 
     #[test]
@@ -815,21 +818,21 @@ mod tests {
         let result = prepare_albums_impl(valid_tree());
         let before = result.albums.clone();
         let untouched = increment_lft_impl(result.albums, "does-not-exist");
-        assert_eq!(untouched.base.lft, before.base.lft);
-        assert_eq!(untouched.base.rgt, before.base.rgt);
+        assert_eq!(untouched.base._lft, before.base._lft);
+        assert_eq!(untouched.base._rgt, before.base._rgt);
     }
 
     #[test]
     fn get_modified_albums_reports_only_changes() {
         let original = valid_tree();
         let mut current = valid_tree();
-        current.lft[1] = 20;
-        current.rgt[1] = 21;
+        current._lft[1] = 20;
+        current._rgt[1] = 21;
         current.id.push("child-c".into());
         current.title.push("child-c".into());
         current.parent_id.push(Some("root".into()));
-        current.lft.push(30);
-        current.rgt.push(31);
+        current._lft.push(30);
+        current._rgt.push(31);
 
         let modified = get_modified_albums_impl(current, original);
         let ids: HashSet<_> = modified.id.into_iter().collect();

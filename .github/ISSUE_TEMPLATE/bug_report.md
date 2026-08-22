@@ -18,8 +18,8 @@ const result = prepareAlbums({
 	id: ["..."],
 	title: ["..."],
 	parent_id: [null],
-	lft: Int32Array.from([1]),
-	rgt: Int32Array.from([2]),
+	_lft: Int32Array.from([1]),
+	_rgt: Int32Array.from([2]),
 });
 ```
 What did you expect `result` to look like, and what did you actually get?

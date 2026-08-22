@@ -5,7 +5,7 @@
 // parent-stack walk, error classification, the four MPTT repair ops, and diffing — to
 // the Wasm module. Only string localization and Vue reactivity live here.
 //
-// v2: albums are struct-of-arrays, not an array of per-row objects. `lft`/`rgt` cross
+// v2: albums are struct-of-arrays, not an array of per-row objects. `_lft`/`_rgt` cross
 // the Wasm boundary as `Int32Array`s and per-row boolean flags as `Uint8Array`s (0/1)
 // instead of a JS array of boxed values per row.
 
@@ -39,8 +39,8 @@ export type AlbumTree = {
 	id: string[];
 	title: string[];
 	parent_id: (string | null)[];
-	lft: Int32Array;
-	rgt: Int32Array;
+	_lft: Int32Array;
+	_rgt: Int32Array;
 };
 
 export type AugmentedAlbumTree = AlbumTree & Augmented;
@@ -76,9 +76,9 @@ function formatError(e: ErrorDescriptor): string {
 	return sprintf(trans(`fix-tree.errors.${e.kind}`), ...ERROR_TRANS_ARGS[e.kind](e));
 }
 
-// Sorts a struct-of-arrays tree by `lft`, keeping every field's columns aligned.
+// Sorts a struct-of-arrays tree by `_lft`, keeping every field's columns aligned.
 function sortByLft<T extends AlbumTree>(tree: T): T {
-	const order = Array.from(tree.id, (_, i) => i).sort((a, b) => tree.lft[a] - tree.lft[b]);
+	const order = Array.from(tree.id, (_, i) => i).sort((a, b) => tree._lft[a] - tree._lft[b]);
 	const pick = <U>(values: U[] | Int32Array | Uint8Array): U[] | Int32Array | Uint8Array => {
 		if (values instanceof Int32Array) return Int32Array.from(order, (i) => values[i]);
 		if (values instanceof Uint8Array) return Uint8Array.from(order, (i) => values[i]);
@@ -158,9 +158,9 @@ export function useTreeOperations(
 		albums.value = wasmDecrementRgt(albums.value as WasmAugmentedAlbumTree, id) as AugmentedAlbumTree;
 	}
 
-	function getModifiedAlbums(): { id: string[]; lft: Int32Array; rgt: Int32Array; parent_id: (string | null)[] } {
+	function getModifiedAlbums(): { id: string[]; _lft: Int32Array; _rgt: Int32Array; parent_id: (string | null)[] } {
 		if (albums.value === undefined || originalAlbums.value === undefined) {
-			return { id: [], lft: new Int32Array(), rgt: new Int32Array(), parent_id: [] };
+			return { id: [], _lft: new Int32Array(), _rgt: new Int32Array(), parent_id: [] };
 		}
 		return wasmGetModifiedAlbums(albums.value as WasmAlbumTree, originalAlbums.value as WasmAlbumTree);
 	}

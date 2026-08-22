@@ -9,22 +9,22 @@ A WebAssembly build of [Lychee](https://github.com/LycheeOrg/Lychee)'s nested-se
 preorder tree traversal, aka MPTT) tree checker — packaged for use from
 TypeScript/JavaScript.
 
-Lychee stores album trees as `lft`/`rgt` pairs. This package validates such a tree
+Lychee stores album trees as `_lft`/`_rgt` pairs. This package validates such a tree
 (duplicate bounds, gaps, rows whose `parent_id` doesn't match where they sit in the
-`lft`/`rgt` ordering) and provides the four MPTT repair operations used to fix it, all
+`_lft`/`_rgt` ordering) and provides the four MPTT repair operations used to fix it, all
 running as compiled Wasm instead of re-walking the array in JS on every keystroke.
 
 **v2** switched the API from array-of-structs to struct-of-arrays: a tree is one object
-holding parallel `id`/`title`/`parent_id`/`lft`/`rgt` arrays instead of an array of
-per-row objects, and `lft`/`rgt` cross the Wasm boundary as a real `Int32Array` (per-row
-boolean flags as `Uint8Array`) instead of a JS array of boxed values. `lft`/`rgt` are
+holding parallel `id`/`title`/`parent_id`/`_lft`/`_rgt` arrays instead of an array of
+per-row objects, and `_lft`/`_rgt` cross the Wasm boundary as a real `Int32Array` (per-row
+boolean flags as `Uint8Array`) instead of a JS array of boxed values. `_lft`/`_rgt` are
 non-nullable; `0` is the "missing/invalid" sentinel.
 
 ## Why
 
 - **Fast on large trees.** The duplicate-detection pass and the parent-stack walk are
   both O(n); running them as Wasm keeps large album trees (thousands of rows) responsive while editing.
-- **Struct-of-arrays, typed arrays at the boundary.** `lft`/`rgt` move as a single
+- **Struct-of-arrays, typed arrays at the boundary.** `_lft`/`_rgt` move as a single
   `Int32Array` copy instead of one boxed JS number per row, cutting allocation and
   marshalling overhead on large trees.
 - **Decisions only, no rendering.** This crate returns structured results — which rows
@@ -57,15 +57,15 @@ const result = prepareAlbums({
 	id: ["root-id", "child-a-id", "child-b-id"],
 	title: ["Root", "Child A", "Child B"],
 	parent_id: [null, "root-id", "root-id"],
-	lft: Int32Array.from([1, 2, 4]),
-	rgt: Int32Array.from([6, 3, 5]),
+	_lft: Int32Array.from([1, 2, 4]),
+	_rgt: Int32Array.from([6, 3, 5]),
 });
 
 console.log(result.isValid); // true
 console.log(result.albums.prefix[1]); // "  │ " — indentation for display
 ```
 
-`source`'s arrays must all be the same length and already sorted by `lft` (same
+`source`'s arrays must all be the same length and already sorted by `_lft` (same
 precondition as the original TS composable).
 
 ### Node.js
@@ -97,14 +97,14 @@ function getModifiedAlbums(current: AlbumTree, original: AlbumTree): ModifiedAlb
 
 | Function             | Purpose                                                                                                    |
 | --------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `prepareAlbums`       | Validates a tree: builds duplicate `lft`/`rgt` sets, walks it tracking a parent stack, classifies errors.   |
-| `incrementLft`        | Shifts every row whose `lft >= id`'s `lft` up by one, making room to insert before it.                       |
-| `incrementRgt`        | Shifts every row whose `rgt >= id`'s `rgt` up by one, making room to insert after/inside it.                 |
+| `prepareAlbums`       | Validates a tree: builds duplicate `_lft`/`_rgt` sets, walks it tracking a parent stack, classifies errors. |
+| `incrementLft`        | Shifts every row whose `_lft >= id`'s `_lft` up by one, making room to insert before it.                     |
+| `incrementRgt`        | Shifts every row whose `_rgt >= id`'s `_rgt` up by one, making room to insert after/inside it.               |
 | `decrementLft`        | Inverse of `incrementLft`.                                                                                    |
 | `decrementRgt`        | Inverse of `incrementRgt`, with a safety check against collapsing a still-nonempty node.                     |
 | `getModifiedAlbums`   | Diffs `current` against `original` by id, returning only the rows that actually changed (or are new).        |
 
-`AlbumTree` is struct-of-arrays: `id`/`title`/`parent_id` are plain JS arrays, `lft`/`rgt`
+`AlbumTree` is struct-of-arrays: `id`/`title`/`parent_id` are plain JS arrays, `_lft`/`_rgt`
 are `Int32Array`s, and every array must be the same length. `AugmentedAlbumTree` is
 `AlbumTree` plus `prefix`/`trimmedId`/`trimmedParentId` (string arrays) and
 `isDuplicate_rgt`/`isDuplicate_lft`/`isExpectedParentId` (`Uint8Array`s of `0`/`1`).
