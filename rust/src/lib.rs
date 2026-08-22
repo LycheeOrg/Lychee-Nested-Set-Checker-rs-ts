@@ -8,10 +8,19 @@
 //! a baseline. Vue reactivity, i18n string lookup and toast notifications stay
 //! in the consuming TypeScript composable — this crate only makes the
 //! decisions, it doesn't render or translate anything.
+//!
+//! v2 note: the public API is struct-of-arrays rather than array-of-structs.
+//! A tree is one object holding parallel `id`/`title`/`parent_id`/`_lft`/`_rgt`
+//! arrays (all the same length) instead of an array of per-row objects.
+//! `_lft`/`_rgt` cross the Wasm boundary as real `Int32Array`s and the boolean
+//! per-row flags as `Uint8Array`s (0/1), avoiding a boxed JS value per cell.
+//! `_lft`/`_rgt` are non-nullable; `0` is the "missing/invalid" sentinel
+//! (mirrors how v1 already treated `null` and `0` identically).
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 
 /// Sets up better panic messages in the browser/Node console.
 ///
@@ -22,33 +31,35 @@ pub fn set_panic_hook() {
     console_error_panic_hook::set_once();
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Struct-of-arrays tree: `id[i]`/`title[i]`/`parent_id[i]`/`_lft[i]`/`_rgt[i]`
+/// together describe row `i`. All fields must have the same length.
+#[derive(Debug, Clone)]
 struct AlbumTree {
-    id: String,
-    title: String,
-    parent_id: Option<String>,
-    _lft: Option<i64>,
-    _rgt: Option<i64>,
+    id: Vec<String>,
+    title: Vec<String>,
+    parent_id: Vec<Option<String>>,
+    _lft: Vec<i32>,
+    _rgt: Vec<i32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AugmentedAlbum {
-    id: String,
-    title: String,
-    parent_id: Option<String>,
-    _lft: Option<i64>,
-    _rgt: Option<i64>,
-    prefix: String,
-    #[serde(rename = "trimmedId")]
-    trimmed_id: String,
-    #[serde(rename = "trimmedParentId")]
-    trimmed_parent_id: String,
-    #[serde(rename = "isDuplicate_rgt")]
-    is_duplicate_rgt: bool,
-    #[serde(rename = "isDuplicate_lft")]
-    is_duplicate_lft: bool,
-    #[serde(rename = "isExpectedParentId")]
-    is_expected_parent_id: bool,
+/// `AlbumTree` plus the per-row fields `prepareAlbums` computes.
+#[derive(Debug, Clone)]
+struct AugmentedAlbumTree {
+    base: AlbumTree,
+    prefix: Vec<String>,
+    trimmed_id: Vec<String>,
+    trimmed_parent_id: Vec<String>,
+    is_duplicate_rgt: Vec<bool>,
+    is_duplicate_lft: Vec<bool>,
+    is_expected_parent_id: Vec<bool>,
+}
+
+/// Diff output of `getModifiedAlbums`: the changed (or newly added) rows only.
+struct ModifiedAlbums {
+    id: Vec<String>,
+    _lft: Vec<i32>,
+    _rgt: Vec<i32>,
+    parent_id: Vec<Option<String>>,
 }
 
 /// Which case of the original composable's `setErrors` if/else chain applies.
@@ -66,39 +77,24 @@ enum ErrorKind {
     Unknown,
 }
 
+/// Note: unlike `AlbumTree`/`ModifiedAlbums`, `lft`/`rgt` here are bare (no
+/// leading underscore) — these are translation-interpolation args for the UI
+/// message, not the DB-shaped tree fields, mirroring the original composable.
 #[derive(Debug, Clone, Serialize)]
 struct ErrorDescriptor {
     #[serde(rename = "trimmedId")]
     trimmed_id: String,
     kind: ErrorKind,
-    lft: Option<i64>,
-    rgt: Option<i64>,
+    lft: i32,
+    rgt: i32,
     #[serde(rename = "parentId")]
     parent_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
 struct PrepareResult {
-    albums: Vec<AugmentedAlbum>,
+    albums: AugmentedAlbumTree,
     errors: Vec<ErrorDescriptor>,
-    #[serde(rename = "isValid")]
     is_valid: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ModifiedAlbum {
-    id: String,
-    _lft: Option<i64>,
-    _rgt: Option<i64>,
-    parent_id: Option<String>,
-}
-
-/// The original TS types declare `_lft`/`_rgt` as non-nullable `number`, but
-/// `isError` defensively checks for `null` anyway (real-world rows can be
-/// mid-repair). JS arithmetic and comparisons coerce `null`/`undefined` to
-/// `0`; this mirrors that coercion explicitly instead of panicking on `None`.
-fn n(v: Option<i64>) -> i64 {
-    v.unwrap_or(0)
 }
 
 fn err_to_js(err: impl std::fmt::Display) -> JsValue {
@@ -111,273 +107,497 @@ fn trim6(s: &str) -> String {
 
 struct PileEntry {
     parent_id: Option<String>,
-    rgt: i64,
+    rgt: i32,
 }
 
-/// A value is a duplicate if it appears more than once as either `_lft` or
-/// `_rgt` across all albums (mirrors `buildDuplicateSets` in the TS source).
-fn build_duplicate_sets(albums: &[AlbumTree]) -> (HashSet<Option<i64>>, HashSet<Option<i64>>) {
-    let mut lft_counts: HashMap<Option<i64>, u32> = HashMap::new();
-    let mut rgt_counts: HashMap<Option<i64>, u32> = HashMap::new();
+// --- JS <-> Rust boundary helpers -----------------------------------------
+//
+// The public contract (see `TS_APPEND_CONTENT` below) declares `_lft`/`_rgt`
+// as `Int32Array` and the boolean flags as `Uint8Array` so real typed arrays
+// cross the boundary instead of a JS array of boxed values. Parsing also
+// accepts a plain `number[]`/`boolean[]` as a defensive fallback.
 
-    for album in albums {
-        *lft_counts.entry(album._lft).or_insert(0) += 1;
-        *rgt_counts.entry(album._rgt).or_insert(0) += 1;
+fn parse_string_vec(obj: &JsValue, key: &str) -> Result<Vec<String>, JsValue> {
+    let value = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
+    let array: js_sys::Array = value
+        .dyn_into()
+        .map_err(|_| JsValue::from_str(&format!("`{key}` must be an array of strings")))?;
+    array
+        .iter()
+        .map(|v| {
+            v.as_string()
+                .ok_or_else(|| JsValue::from_str(&format!("`{key}` must contain only strings")))
+        })
+        .collect()
+}
+
+fn parse_opt_string_vec(obj: &JsValue, key: &str) -> Result<Vec<Option<String>>, JsValue> {
+    let value = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
+    let array: js_sys::Array = value
+        .dyn_into()
+        .map_err(|_| JsValue::from_str(&format!("`{key}` must be an array of strings or null")))?;
+    Ok(array.iter().map(|v| v.as_string()).collect())
+}
+
+fn parse_i32_vec(obj: &JsValue, key: &str) -> Result<Vec<i32>, JsValue> {
+    let value = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
+    if let Some(typed) = value.dyn_ref::<js_sys::Int32Array>() {
+        return Ok(typed.to_vec());
+    }
+    let array: js_sys::Array = value
+        .dyn_into()
+        .map_err(|_| JsValue::from_str(&format!("`{key}` must be an Int32Array or number[]")))?;
+    array
+        .iter()
+        .map(|v| {
+            v.as_f64()
+                .map(|f| f as i32)
+                .ok_or_else(|| JsValue::from_str(&format!("`{key}` must contain only numbers")))
+        })
+        .collect()
+}
+
+fn parse_bool_vec(obj: &JsValue, key: &str) -> Result<Vec<bool>, JsValue> {
+    let value = js_sys::Reflect::get(obj, &JsValue::from_str(key))?;
+    if let Some(typed) = value.dyn_ref::<js_sys::Uint8Array>() {
+        return Ok(typed.to_vec().into_iter().map(|b| b != 0).collect());
+    }
+    let array: js_sys::Array = value
+        .dyn_into()
+        .map_err(|_| JsValue::from_str(&format!("`{key}` must be a Uint8Array or boolean[]")))?;
+    Ok(array
+        .iter()
+        .map(|v| {
+            v.as_bool()
+                .unwrap_or_else(|| v.as_f64().map(|f| f != 0.0).unwrap_or(false))
+        })
+        .collect())
+}
+
+fn to_string_array(values: &[String]) -> JsValue {
+    values
+        .iter()
+        .map(|s| JsValue::from_str(s))
+        .collect::<js_sys::Array>()
+        .into()
+}
+
+fn to_opt_string_array(values: &[Option<String>]) -> JsValue {
+    values
+        .iter()
+        .map(|v| v.as_deref().map(JsValue::from_str).unwrap_or(JsValue::NULL))
+        .collect::<js_sys::Array>()
+        .into()
+}
+
+fn to_i32_array(values: &[i32]) -> JsValue {
+    js_sys::Int32Array::from(values).into()
+}
+
+fn to_bool_array(values: &[bool]) -> JsValue {
+    let bytes: Vec<u8> = values.iter().map(|&b| b as u8).collect();
+    js_sys::Uint8Array::from(bytes.as_slice()).into()
+}
+
+fn set_prop(obj: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), JsValue> {
+    js_sys::Reflect::set(obj.as_ref(), &JsValue::from_str(key), value)?;
+    Ok(())
+}
+
+fn album_tree_from_js(source: &JsValue) -> Result<AlbumTree, JsValue> {
+    let id = parse_string_vec(source, "id")?;
+    let title = parse_string_vec(source, "title")?;
+    let parent_id = parse_opt_string_vec(source, "parent_id")?;
+    let _lft = parse_i32_vec(source, "_lft")?;
+    let _rgt = parse_i32_vec(source, "_rgt")?;
+
+    let len = id.len();
+    if title.len() != len || parent_id.len() != len || _lft.len() != len || _rgt.len() != len {
+        return Err(JsValue::from_str(
+            "AlbumTree arrays must all have the same length",
+        ));
+    }
+
+    Ok(AlbumTree {
+        id,
+        title,
+        parent_id,
+        _lft,
+        _rgt,
+    })
+}
+
+fn augmented_from_js(source: &JsValue) -> Result<AugmentedAlbumTree, JsValue> {
+    let base = album_tree_from_js(source)?;
+    let len = base.id.len();
+
+    let prefix = parse_string_vec(source, "prefix")?;
+    let trimmed_id = parse_string_vec(source, "trimmedId")?;
+    let trimmed_parent_id = parse_string_vec(source, "trimmedParentId")?;
+    let is_duplicate_rgt = parse_bool_vec(source, "isDuplicate_rgt")?;
+    let is_duplicate_lft = parse_bool_vec(source, "isDuplicate_lft")?;
+    let is_expected_parent_id = parse_bool_vec(source, "isExpectedParentId")?;
+
+    if prefix.len() != len
+        || trimmed_id.len() != len
+        || trimmed_parent_id.len() != len
+        || is_duplicate_rgt.len() != len
+        || is_duplicate_lft.len() != len
+        || is_expected_parent_id.len() != len
+    {
+        return Err(JsValue::from_str(
+            "AugmentedAlbumTree arrays must all have the same length",
+        ));
+    }
+
+    Ok(AugmentedAlbumTree {
+        base,
+        prefix,
+        trimmed_id,
+        trimmed_parent_id,
+        is_duplicate_rgt,
+        is_duplicate_lft,
+        is_expected_parent_id,
+    })
+}
+
+fn album_tree_object(tree: &AlbumTree) -> Result<js_sys::Object, JsValue> {
+    let obj = js_sys::Object::new();
+    set_prop(&obj, "id", &to_string_array(&tree.id))?;
+    set_prop(&obj, "title", &to_string_array(&tree.title))?;
+    set_prop(&obj, "parent_id", &to_opt_string_array(&tree.parent_id))?;
+    set_prop(&obj, "_lft", &to_i32_array(&tree._lft))?;
+    set_prop(&obj, "_rgt", &to_i32_array(&tree._rgt))?;
+    Ok(obj)
+}
+
+fn augmented_object(a: &AugmentedAlbumTree) -> Result<JsValue, JsValue> {
+    let obj = album_tree_object(&a.base)?;
+    set_prop(&obj, "prefix", &to_string_array(&a.prefix))?;
+    set_prop(&obj, "trimmedId", &to_string_array(&a.trimmed_id))?;
+    set_prop(
+        &obj,
+        "trimmedParentId",
+        &to_string_array(&a.trimmed_parent_id),
+    )?;
+    set_prop(&obj, "isDuplicate_rgt", &to_bool_array(&a.is_duplicate_rgt))?;
+    set_prop(&obj, "isDuplicate_lft", &to_bool_array(&a.is_duplicate_lft))?;
+    set_prop(
+        &obj,
+        "isExpectedParentId",
+        &to_bool_array(&a.is_expected_parent_id),
+    )?;
+    Ok(obj.into())
+}
+
+fn prepare_result_to_js(result: &PrepareResult) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    set_prop(&obj, "albums", &augmented_object(&result.albums)?)?;
+    set_prop(
+        &obj,
+        "errors",
+        &serde_wasm_bindgen::to_value(&result.errors).map_err(err_to_js)?,
+    )?;
+    set_prop(&obj, "isValid", &JsValue::from_bool(result.is_valid))?;
+    Ok(obj.into())
+}
+
+fn modified_albums_to_js(m: &ModifiedAlbums) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    set_prop(&obj, "id", &to_string_array(&m.id))?;
+    set_prop(&obj, "_lft", &to_i32_array(&m._lft))?;
+    set_prop(&obj, "_rgt", &to_i32_array(&m._rgt))?;
+    set_prop(&obj, "parent_id", &to_opt_string_array(&m.parent_id))?;
+    Ok(obj.into())
+}
+
+// --- Pure tree/array logic (no JS types below this point) -----------------
+
+/// A value is a duplicate if it appears more than once as either `_lft` or
+/// `_rgt` across all rows (mirrors `buildDuplicateSets` in the TS source).
+fn build_duplicate_sets(lft: &[i32], rgt: &[i32]) -> (HashSet<i32>, HashSet<i32>) {
+    let mut lft_counts: HashMap<i32, u32> = HashMap::new();
+    let mut rgt_counts: HashMap<i32, u32> = HashMap::new();
+
+    for i in 0..lft.len() {
+        *lft_counts.entry(lft[i]).or_insert(0) += 1;
+        *rgt_counts.entry(rgt[i]).or_insert(0) += 1;
     }
 
     let mut duplicate_lfts = HashSet::new();
     let mut duplicate_rgts = HashSet::new();
 
-    for album in albums {
-        let lft_total = lft_counts.get(&album._lft).copied().unwrap_or(0)
-            + rgt_counts.get(&album._lft).copied().unwrap_or(0);
+    for i in 0..lft.len() {
+        let lft_total = lft_counts.get(&lft[i]).copied().unwrap_or(0)
+            + rgt_counts.get(&lft[i]).copied().unwrap_or(0);
         if lft_total > 1 {
-            duplicate_lfts.insert(album._lft);
+            duplicate_lfts.insert(lft[i]);
         }
 
-        let rgt_total = lft_counts.get(&album._rgt).copied().unwrap_or(0)
-            + rgt_counts.get(&album._rgt).copied().unwrap_or(0);
+        let rgt_total = lft_counts.get(&rgt[i]).copied().unwrap_or(0)
+            + rgt_counts.get(&rgt[i]).copied().unwrap_or(0);
         if rgt_total > 1 {
-            duplicate_rgts.insert(album._rgt);
+            duplicate_rgts.insert(rgt[i]);
         }
     }
 
     (duplicate_lfts, duplicate_rgts)
 }
 
-fn is_error(album: &AugmentedAlbum) -> bool {
-    album._lft.is_none()
-        || album._rgt.is_none()
-        || album._lft == Some(0)
-        || album._rgt == Some(0)
-        || album.is_duplicate_lft
-        || album.is_duplicate_rgt
-        || !album.is_expected_parent_id
-}
-
-fn classify_error(album: &AugmentedAlbum) -> ErrorKind {
-    if album._lft.is_none() || album._lft == Some(0) {
+fn classify_error(
+    lft: i32,
+    rgt: i32,
+    is_duplicate_lft: bool,
+    is_duplicate_rgt: bool,
+    is_expected_parent_id: bool,
+) -> ErrorKind {
+    if lft == 0 {
         ErrorKind::InvalidLeft
-    } else if album._rgt.is_none() || album._rgt == Some(0) {
+    } else if rgt == 0 {
         ErrorKind::InvalidRight
-    } else if n(album._lft) >= n(album._rgt) {
+    } else if lft >= rgt {
         ErrorKind::InvalidLeftRight
-    } else if album.is_duplicate_lft {
+    } else if is_duplicate_lft {
         ErrorKind::DuplicateLeft
-    } else if album.is_duplicate_rgt {
+    } else if is_duplicate_rgt {
         ErrorKind::DuplicateRight
-    } else if !album.is_expected_parent_id {
+    } else if !is_expected_parent_id {
         ErrorKind::Parent
     } else {
         ErrorKind::Unknown
     }
 }
 
-fn prepare_albums_impl(source: Vec<AlbumTree>) -> PrepareResult {
-    let (duplicate_lfts, duplicate_rgts) = build_duplicate_sets(&source);
+fn prepare_albums_impl(tree: AlbumTree) -> PrepareResult {
+    let len = tree.id.len();
+    let (duplicate_lfts, duplicate_rgts) = build_duplicate_sets(&tree._lft, &tree._rgt);
 
-    let mut albums = Vec::with_capacity(source.len());
+    let mut prefix = Vec::with_capacity(len);
+    let mut trimmed_id = Vec::with_capacity(len);
+    let mut trimmed_parent_id = Vec::with_capacity(len);
+    let mut is_duplicate_lft = Vec::with_capacity(len);
+    let mut is_duplicate_rgt = Vec::with_capacity(len);
+    let mut is_expected_parent_id = Vec::with_capacity(len);
+    let mut errors = Vec::new();
+
     let mut pile: Vec<PileEntry> = Vec::new();
 
-    for album in source {
-        let trimmed_id = trim6(&album.id);
-        let trimmed_parent_id = trim6(album.parent_id.as_deref().unwrap_or("root"));
-        let is_duplicate_lft = duplicate_lfts.contains(&album._lft);
-        let is_duplicate_rgt = duplicate_rgts.contains(&album._rgt);
+    for i in 0..len {
+        let row_trimmed_id = trim6(&tree.id[i]);
+        let row_trimmed_parent_id = trim6(tree.parent_id[i].as_deref().unwrap_or("root"));
+        let row_is_duplicate_lft = duplicate_lfts.contains(&tree._lft[i]);
+        let row_is_duplicate_rgt = duplicate_rgts.contains(&tree._rgt[i]);
 
         // If current lft/rgt is greater than the last pile entry's rgt, we're
-        // no longer inside it: pop until we're back inside the enclosing album.
+        // no longer inside it: pop until we're back inside the enclosing row.
         while let Some(top) = pile.last() {
-            if n(album._lft) > top.rgt || n(album._rgt) > top.rgt {
+            if tree._lft[i] > top.rgt || tree._rgt[i] > top.rgt {
                 pile.pop();
             } else {
                 break;
             }
         }
 
-        let is_expected_parent_id = match pile.last() {
-            Some(top) => top.parent_id == album.parent_id,
-            None => album.parent_id.is_none(),
+        let row_is_expected_parent_id = match pile.last() {
+            Some(top) => top.parent_id == tree.parent_id[i],
+            None => tree.parent_id[i].is_none(),
         };
 
-        let prefix = "  │ ".repeat(pile.len());
-        let is_parent = n(album._rgt) > n(album._lft) + 1;
+        prefix.push("  │ ".repeat(pile.len()));
 
-        let AlbumTree {
-            id,
-            title,
-            parent_id,
-            _lft,
-            _rgt,
-        } = album;
-
+        let is_parent = tree._rgt[i] > tree._lft[i] + 1;
         if is_parent {
             pile.push(PileEntry {
-                parent_id: Some(id.clone()),
-                rgt: n(_rgt),
+                parent_id: Some(tree.id[i].clone()),
+                rgt: tree._rgt[i],
             });
         }
 
-        albums.push(AugmentedAlbum {
-            id,
-            title,
-            parent_id,
-            _lft,
-            _rgt,
-            prefix,
-            trimmed_id,
-            trimmed_parent_id,
-            is_duplicate_lft,
-            is_duplicate_rgt,
-            is_expected_parent_id,
-        });
-    }
-
-    let mut errors = Vec::new();
-    for album in &albums {
-        if is_error(album) {
+        if tree._lft[i] == 0
+            || tree._rgt[i] == 0
+            || row_is_duplicate_lft
+            || row_is_duplicate_rgt
+            || !row_is_expected_parent_id
+        {
             errors.push(ErrorDescriptor {
-                trimmed_id: album.trimmed_id.clone(),
-                kind: classify_error(album),
-                lft: album._lft,
-                rgt: album._rgt,
-                parent_id: album.parent_id.clone(),
+                trimmed_id: row_trimmed_id.clone(),
+                kind: classify_error(
+                    tree._lft[i],
+                    tree._rgt[i],
+                    row_is_duplicate_lft,
+                    row_is_duplicate_rgt,
+                    row_is_expected_parent_id,
+                ),
+                lft: tree._lft[i],
+                rgt: tree._rgt[i],
+                parent_id: tree.parent_id[i].clone(),
             });
         }
+
+        trimmed_id.push(row_trimmed_id);
+        trimmed_parent_id.push(row_trimmed_parent_id);
+        is_duplicate_lft.push(row_is_duplicate_lft);
+        is_duplicate_rgt.push(row_is_duplicate_rgt);
+        is_expected_parent_id.push(row_is_expected_parent_id);
     }
+
     let is_valid = errors.is_empty();
 
     PrepareResult {
-        albums,
+        albums: AugmentedAlbumTree {
+            base: tree,
+            prefix,
+            trimmed_id,
+            trimmed_parent_id,
+            is_duplicate_rgt,
+            is_duplicate_lft,
+            is_expected_parent_id,
+        },
         errors,
         is_valid,
     }
 }
 
-// We increment all the nodes' (>= lft) left and right by 1.
-fn increment_lft_impl(mut albums: Vec<AugmentedAlbum>, id: &str) -> Vec<AugmentedAlbum> {
-    let Some(lft) = albums.iter().find(|a| a.id == id).map(|a| n(a._lft)) else {
+// We increment all the rows' (>= lft) left and right by 1.
+fn increment_lft_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbumTree {
+    let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
+    let lft = albums.base._lft[idx];
 
-    for a in albums.iter_mut() {
-        if n(a._lft) < lft {
+    for i in 0..albums.base.id.len() {
+        if albums.base._lft[i] < lft {
             continue;
         }
-        a._lft = Some(n(a._lft) + 1);
-        a._rgt = Some(n(a._rgt) + 1);
+        albums.base._lft[i] += 1;
+        albums.base._rgt[i] += 1;
     }
     albums
 }
 
-// We increment all the nodes above rgt by 1 and increment rgt by 1.
-fn increment_rgt_impl(mut albums: Vec<AugmentedAlbum>, id: &str) -> Vec<AugmentedAlbum> {
-    let Some(rgt) = albums.iter().find(|a| a.id == id).map(|a| n(a._rgt)) else {
+// We increment all the rows above rgt by 1 and increment rgt by 1.
+fn increment_rgt_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbumTree {
+    let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
+    let rgt = albums.base._rgt[idx];
 
-    for a in albums.iter_mut() {
-        let a_rgt = n(a._rgt);
+    for i in 0..albums.base.id.len() {
+        let a_rgt = albums.base._rgt[i];
         if a_rgt < rgt {
             continue;
         }
         if a_rgt == rgt {
-            a._rgt = Some(a_rgt + 1);
+            albums.base._rgt[i] += 1;
         } else {
-            a._lft = Some(n(a._lft) + 1);
-            a._rgt = Some(a_rgt + 1);
+            albums.base._lft[i] += 1;
+            albums.base._rgt[i] += 1;
         }
     }
     albums
 }
 
-// We decrement all the nodes above lft by 1.
-fn decrement_lft_impl(mut albums: Vec<AugmentedAlbum>, id: &str) -> Vec<AugmentedAlbum> {
-    let Some(lft) = albums.iter().find(|a| a.id == id).map(|a| n(a._lft)) else {
+// We decrement all the rows above lft by 1.
+fn decrement_lft_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbumTree {
+    let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
+    let lft = albums.base._lft[idx];
 
-    for a in albums.iter_mut() {
-        if n(a._lft) < lft {
+    for i in 0..albums.base.id.len() {
+        if albums.base._lft[i] < lft {
             continue;
         }
-        a._lft = Some(n(a._lft) - 1);
-        a._rgt = Some(n(a._rgt) - 1);
+        albums.base._lft[i] -= 1;
+        albums.base._rgt[i] -= 1;
     }
     albums
 }
 
-// We decrement all the nodes above rgt by 1 and decrement rgt by 1 IF lft > rgt - 1.
-fn decrement_rgt_impl(mut albums: Vec<AugmentedAlbum>, id: &str) -> Vec<AugmentedAlbum> {
-    let Some(rgt) = albums.iter().find(|a| a.id == id).map(|a| n(a._rgt)) else {
+// We decrement all the rows above rgt by 1 and decrement rgt by 1 IF lft > rgt - 1.
+fn decrement_rgt_impl(mut albums: AugmentedAlbumTree, id: &str) -> AugmentedAlbumTree {
+    let Some(idx) = albums.base.id.iter().position(|i| i == id) else {
         return albums;
     };
+    let rgt = albums.base._rgt[idx];
 
-    for a in albums.iter_mut() {
-        let a_rgt = n(a._rgt);
+    for i in 0..albums.base.id.len() {
+        let a_rgt = albums.base._rgt[i];
         if a_rgt < rgt {
             continue;
         }
         // safety check
-        if n(a._lft) == rgt - 1 {
+        if albums.base._lft[i] == rgt - 1 {
             continue;
         }
         if a_rgt == rgt {
-            a._rgt = Some(a_rgt - 1);
+            albums.base._rgt[i] -= 1;
         } else {
             // Mirrors the upstream TS composable's `decrementRgt` verbatim,
             // including its else-branch incrementing rather than
             // decrementing (matching `incrementRgt`'s else-branch). This is
             // a faithful port, not a bugfix — flagged for upstream review.
-            a._lft = Some(n(a._lft) + 1);
-            a._rgt = Some(a_rgt + 1);
+            albums.base._lft[i] += 1;
+            albums.base._rgt[i] += 1;
         }
     }
     albums
 }
 
-fn get_modified_albums_impl(
-    current: Vec<AlbumTree>,
-    original: Vec<AlbumTree>,
-) -> Vec<ModifiedAlbum> {
-    let original_map: HashMap<String, AlbumTree> =
-        original.into_iter().map(|a| (a.id.clone(), a)).collect();
+fn get_modified_albums_impl(current: AlbumTree, original: AlbumTree) -> ModifiedAlbums {
+    let mut original_index: HashMap<&str, usize> = HashMap::with_capacity(original.id.len());
+    for (i, id) in original.id.iter().enumerate() {
+        original_index.insert(id.as_str(), i);
+    }
 
-    current
-        .into_iter()
-        .filter(|a| match original_map.get(&a.id) {
+    let mut result = ModifiedAlbums {
+        id: Vec::new(),
+        _lft: Vec::new(),
+        _rgt: Vec::new(),
+        parent_id: Vec::new(),
+    };
+
+    for i in 0..current.id.len() {
+        let changed = match original_index.get(current.id[i].as_str()) {
             None => true,
-            Some(orig) => {
-                a._lft != orig._lft || a._rgt != orig._rgt || a.parent_id != orig.parent_id
+            Some(&oi) => {
+                current._lft[i] != original._lft[oi]
+                    || current._rgt[i] != original._rgt[oi]
+                    || current.parent_id[i] != original.parent_id[oi]
             }
-        })
-        .map(|a| ModifiedAlbum {
-            id: a.id,
-            _lft: a._lft,
-            _rgt: a._rgt,
-            parent_id: a.parent_id,
-        })
-        .collect()
+        };
+
+        if changed {
+            result.id.push(current.id[i].clone());
+            result._lft.push(current._lft[i]);
+            result._rgt.push(current._rgt[i]);
+            result.parent_id.push(current.parent_id[i].clone());
+        }
+    }
+
+    result
 }
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_APPEND_CONTENT: &'static str = r#"
 export interface AlbumTree {
-    id: string;
-    title: string;
-    parent_id: string | null;
-    _lft: number | null;
-    _rgt: number | null;
+    id: string[];
+    title: string[];
+    parent_id: (string | null)[];
+    _lft: Int32Array;
+    _rgt: Int32Array;
 }
 
-export interface AugmentedAlbum extends AlbumTree {
-    prefix: string;
-    trimmedId: string;
-    trimmedParentId: string;
-    isDuplicate_rgt: boolean;
-    isDuplicate_lft: boolean;
-    isExpectedParentId: boolean;
+export interface Augmented {
+    prefix: string[];
+    trimmedId: string[];
+    trimmedParentId: string[];
+    isDuplicate_rgt: Uint8Array;
+    isDuplicate_lft: Uint8Array;
+    isExpectedParentId: Uint8Array;
 }
+
+export type AugmentedAlbumTree = AlbumTree & Augmented;
 
 export type ErrorKind =
     | "invalid_left"
@@ -396,22 +616,22 @@ export type ErrorKind =
 export interface ErrorDescriptor {
     trimmedId: string;
     kind: ErrorKind;
-    lft: number | null;
-    rgt: number | null;
+    lft: number;
+    rgt: number;
     parentId: string | null;
 }
 
 export interface PrepareResult {
-    albums: AugmentedAlbum[];
+    albums: AugmentedAlbumTree;
     errors: ErrorDescriptor[];
     isValid: boolean;
 }
 
-export interface ModifiedAlbum {
-    id: string;
-    _lft: number | null;
-    _rgt: number | null;
-    parent_id: string | null;
+export interface ModifiedAlbums {
+    id: string[];
+    _lft: Int32Array;
+    _rgt: Int32Array;
+    parent_id: (string | null)[];
 }
 "#;
 
@@ -419,94 +639,90 @@ export interface ModifiedAlbum {
 /// `_lft` order tracking a parent stack to flag rows with an unexpected
 /// `parent_id`, and classifies every row that fails validation. `source`
 /// should already be sorted by `_lft` (the original composable relies on the
-/// same precondition).
+/// same precondition), and all of its arrays must have the same length.
 #[wasm_bindgen(js_name = prepareAlbums, unchecked_return_type = "PrepareResult")]
 pub fn prepare_albums(
-    #[wasm_bindgen(unchecked_param_type = "AlbumTree[]")] source: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AlbumTree")] source: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let source: Vec<AlbumTree> = serde_wasm_bindgen::from_value(source).map_err(err_to_js)?;
-    let result = prepare_albums_impl(source);
-    serde_wasm_bindgen::to_value(&result).map_err(err_to_js)
+    let tree = album_tree_from_js(&source)?;
+    let result = prepare_albums_impl(tree);
+    prepare_result_to_js(&result)
 }
 
-/// Shifts every album whose `_lft` is `>= id`'s `_lft` up by one, making room
-/// to insert immediately before it.
-#[wasm_bindgen(js_name = incrementLft, unchecked_return_type = "AugmentedAlbum[]")]
+/// Shifts every row whose `_lft` is `>= id`'s `_lft` up by one, making room to
+/// insert immediately before it.
+#[wasm_bindgen(js_name = incrementLft, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn increment_lft(
-    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbum[]")] albums: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
     id: &str,
 ) -> Result<JsValue, JsValue> {
-    let albums: Vec<AugmentedAlbum> = serde_wasm_bindgen::from_value(albums).map_err(err_to_js)?;
-    serde_wasm_bindgen::to_value(&increment_lft_impl(albums, id)).map_err(err_to_js)
+    let albums = augmented_from_js(&albums)?;
+    augmented_object(&increment_lft_impl(albums, id))
 }
 
-/// Shifts every album whose `_rgt` is `>= id`'s `_rgt` up by one, making room
-/// to insert immediately after it (as a sibling) or as its first child.
-#[wasm_bindgen(js_name = incrementRgt, unchecked_return_type = "AugmentedAlbum[]")]
+/// Shifts every row whose `_rgt` is `>= id`'s `_rgt` up by one, making room to
+/// insert immediately after it (as a sibling) or as its first child.
+#[wasm_bindgen(js_name = incrementRgt, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn increment_rgt(
-    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbum[]")] albums: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
     id: &str,
 ) -> Result<JsValue, JsValue> {
-    let albums: Vec<AugmentedAlbum> = serde_wasm_bindgen::from_value(albums).map_err(err_to_js)?;
-    serde_wasm_bindgen::to_value(&increment_rgt_impl(albums, id)).map_err(err_to_js)
+    let albums = augmented_from_js(&albums)?;
+    augmented_object(&increment_rgt_impl(albums, id))
 }
 
-/// Inverse of [`increment_lft`]: closes the gap left by removing an album at
+/// Inverse of [`increment_lft`]: closes the gap left by removing a row at
 /// `id`'s `_lft`.
-#[wasm_bindgen(js_name = decrementLft, unchecked_return_type = "AugmentedAlbum[]")]
+#[wasm_bindgen(js_name = decrementLft, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn decrement_lft(
-    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbum[]")] albums: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
     id: &str,
 ) -> Result<JsValue, JsValue> {
-    let albums: Vec<AugmentedAlbum> = serde_wasm_bindgen::from_value(albums).map_err(err_to_js)?;
-    serde_wasm_bindgen::to_value(&decrement_lft_impl(albums, id)).map_err(err_to_js)
+    let albums = augmented_from_js(&albums)?;
+    augmented_object(&decrement_lft_impl(albums, id))
 }
 
-/// Inverse of [`increment_rgt`]: closes the gap left by removing an album at
+/// Inverse of [`increment_rgt`]: closes the gap left by removing a row at
 /// `id`'s `_rgt`, unless the safety check (`_lft === _rgt - 1`) trips.
-#[wasm_bindgen(js_name = decrementRgt, unchecked_return_type = "AugmentedAlbum[]")]
+#[wasm_bindgen(js_name = decrementRgt, unchecked_return_type = "AugmentedAlbumTree")]
 pub fn decrement_rgt(
-    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbum[]")] albums: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AugmentedAlbumTree")] albums: JsValue,
     id: &str,
 ) -> Result<JsValue, JsValue> {
-    let albums: Vec<AugmentedAlbum> = serde_wasm_bindgen::from_value(albums).map_err(err_to_js)?;
-    serde_wasm_bindgen::to_value(&decrement_rgt_impl(albums, id)).map_err(err_to_js)
+    let albums = augmented_from_js(&albums)?;
+    augmented_object(&decrement_rgt_impl(albums, id))
 }
 
 /// Diffs `current` against `original` by id, returning only the rows whose
 /// `_lft`, `_rgt` or `parent_id` changed (plus any row in `current` that
 /// isn't in `original` at all, i.e. newly added).
-#[wasm_bindgen(js_name = getModifiedAlbums, unchecked_return_type = "ModifiedAlbum[]")]
+#[wasm_bindgen(js_name = getModifiedAlbums, unchecked_return_type = "ModifiedAlbums")]
 pub fn get_modified_albums(
-    #[wasm_bindgen(unchecked_param_type = "AlbumTree[]")] current: JsValue,
-    #[wasm_bindgen(unchecked_param_type = "AlbumTree[]")] original: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AlbumTree")] current: JsValue,
+    #[wasm_bindgen(unchecked_param_type = "AlbumTree")] original: JsValue,
 ) -> Result<JsValue, JsValue> {
-    let current: Vec<AlbumTree> = serde_wasm_bindgen::from_value(current).map_err(err_to_js)?;
-    let original: Vec<AlbumTree> = serde_wasm_bindgen::from_value(original).map_err(err_to_js)?;
-    serde_wasm_bindgen::to_value(&get_modified_albums_impl(current, original)).map_err(err_to_js)
+    let current = album_tree_from_js(&current)?;
+    let original = album_tree_from_js(&original)?;
+    modified_albums_to_js(&get_modified_albums_impl(current, original))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn album(id: &str, parent_id: Option<&str>, lft: i64, rgt: i64) -> AlbumTree {
+    fn valid_tree() -> AlbumTree {
+        // root(1,6) -> child-a(2,3), child-b(4,5)
         AlbumTree {
-            id: id.to_string(),
-            title: id.to_string(),
-            parent_id: parent_id.map(str::to_string),
-            _lft: Some(lft),
-            _rgt: Some(rgt),
+            id: vec!["root".into(), "child-a".into(), "child-b".into()],
+            title: vec!["root".into(), "child-a".into(), "child-b".into()],
+            parent_id: vec![None, Some("root".into()), Some("root".into())],
+            _lft: vec![1, 2, 4],
+            _rgt: vec![6, 3, 5],
         }
     }
 
-    fn valid_tree() -> Vec<AlbumTree> {
-        // root(1,6) -> child-a(2,3), child-b(4,5)
-        vec![
-            album("root", None, 1, 6),
-            album("child-a", Some("root"), 2, 3),
-            album("child-b", Some("root"), 4, 5),
-        ]
+    fn index_of(tree: &AugmentedAlbumTree, id: &str) -> usize {
+        tree.base.id.iter().position(|i| i == id).unwrap()
     }
 
     #[test]
@@ -514,14 +730,14 @@ mod tests {
         let result = prepare_albums_impl(valid_tree());
         assert!(result.is_valid);
         assert!(result.errors.is_empty());
-        assert_eq!(result.albums[1].prefix, "  │ ");
-        assert_eq!(result.albums[0].prefix, "");
+        assert_eq!(result.albums.prefix[0], "");
+        assert_eq!(result.albums.prefix[1], "  │ ");
     }
 
     #[test]
     fn detects_duplicate_lft_and_rgt() {
         let mut tree = valid_tree();
-        tree[2]._lft = Some(2); // now collides with child-a's _lft
+        tree._lft[2] = 2; // now collides with child-a's _lft
         let result = prepare_albums_impl(tree);
         assert!(!result.is_valid);
         assert!(result
@@ -531,10 +747,10 @@ mod tests {
     }
 
     #[test]
-    fn detects_null_and_zero_lft_rgt() {
+    fn detects_zero_lft_rgt() {
         let mut tree = valid_tree();
-        tree[1]._lft = None;
-        tree[2]._rgt = Some(0);
+        tree._lft[1] = 0;
+        tree._rgt[2] = 0;
         let result = prepare_albums_impl(tree);
         assert!(!result.is_valid);
         let kinds: Vec<_> = result.errors.iter().map(|e| e.kind).collect();
@@ -545,8 +761,8 @@ mod tests {
     #[test]
     fn detects_lft_gte_rgt() {
         let mut tree = valid_tree();
-        tree[1]._lft = Some(3);
-        tree[1]._rgt = Some(3);
+        tree._lft[1] = 3;
+        tree._rgt[1] = 3;
         let result = prepare_albums_impl(tree);
         assert!(result
             .errors
@@ -557,7 +773,7 @@ mod tests {
     #[test]
     fn detects_unexpected_parent_id() {
         let mut tree = valid_tree();
-        tree[1].parent_id = Some("someone-else".to_string());
+        tree.parent_id[1] = Some("someone-else".to_string());
         let result = prepare_albums_impl(tree);
         assert!(result.errors.iter().any(|e| e.kind == ErrorKind::Parent));
     }
@@ -566,26 +782,24 @@ mod tests {
     fn increment_lft_shifts_everything_at_or_after() {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_lft_impl(result.albums, "child-b");
-        let a = |id: &str| shifted.iter().find(|a| a.id == id).unwrap();
         // Only rows whose _lft >= 4 move; root's _lft is 1, so it (and its
         // _rgt) is left untouched even though 6 >= 4.
-        assert_eq!(a("root")._lft, Some(1));
-        assert_eq!(a("root")._rgt, Some(6));
-        assert_eq!(a("child-a")._lft, Some(2));
-        assert_eq!(a("child-b")._lft, Some(5));
-        assert_eq!(a("child-b")._rgt, Some(6));
+        assert_eq!(shifted.base._lft[index_of(&shifted, "root")], 1);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "root")], 6);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-a")], 2);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-b")], 5);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-b")], 6);
     }
 
     #[test]
     fn increment_rgt_widens_the_target_only_at_boundary() {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_rgt_impl(result.albums, "child-a");
-        let a = |id: &str| shifted.iter().find(|a| a.id == id).unwrap();
-        assert_eq!(a("child-a")._rgt, Some(4));
-        assert_eq!(a("child-a")._lft, Some(2)); // exact rgt match: only rgt moves
-        assert_eq!(a("child-b")._lft, Some(5));
-        assert_eq!(a("child-b")._rgt, Some(6));
-        assert_eq!(a("root")._rgt, Some(7));
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-a")], 4);
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-a")], 2); // exact rgt match: only rgt moves
+        assert_eq!(shifted.base._lft[index_of(&shifted, "child-b")], 5);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "child-b")], 6);
+        assert_eq!(shifted.base._rgt[index_of(&shifted, "root")], 7);
     }
 
     #[test]
@@ -593,40 +807,35 @@ mod tests {
         let result = prepare_albums_impl(valid_tree());
         let shifted = increment_lft_impl(result.albums, "child-b");
         let restored = decrement_lft_impl(shifted, "child-b");
-        let a = |id: &str| restored.iter().find(|a| a.id == id).unwrap();
-        assert_eq!(a("root")._lft, Some(1));
-        assert_eq!(a("root")._rgt, Some(6));
-        assert_eq!(a("child-b")._lft, Some(4));
-        assert_eq!(a("child-b")._rgt, Some(5));
+        assert_eq!(restored.base._lft[index_of(&restored, "root")], 1);
+        assert_eq!(restored.base._rgt[index_of(&restored, "root")], 6);
+        assert_eq!(restored.base._lft[index_of(&restored, "child-b")], 4);
+        assert_eq!(restored.base._rgt[index_of(&restored, "child-b")], 5);
     }
 
     #[test]
     fn unknown_id_leaves_albums_untouched() {
         let result = prepare_albums_impl(valid_tree());
-        let untouched = increment_lft_impl(result.albums.clone(), "does-not-exist");
-        assert_eq!(
-            untouched
-                .iter()
-                .map(|a| (a._lft, a._rgt))
-                .collect::<Vec<_>>(),
-            result
-                .albums
-                .iter()
-                .map(|a| (a._lft, a._rgt))
-                .collect::<Vec<_>>()
-        );
+        let before = result.albums.clone();
+        let untouched = increment_lft_impl(result.albums, "does-not-exist");
+        assert_eq!(untouched.base._lft, before.base._lft);
+        assert_eq!(untouched.base._rgt, before.base._rgt);
     }
 
     #[test]
     fn get_modified_albums_reports_only_changes() {
         let original = valid_tree();
         let mut current = valid_tree();
-        current[1]._lft = Some(20);
-        current[1]._rgt = Some(21);
-        current.push(album("child-c", Some("root"), 30, 31));
+        current._lft[1] = 20;
+        current._rgt[1] = 21;
+        current.id.push("child-c".into());
+        current.title.push("child-c".into());
+        current.parent_id.push(Some("root".into()));
+        current._lft.push(30);
+        current._rgt.push(31);
 
         let modified = get_modified_albums_impl(current, original);
-        let ids: HashSet<_> = modified.iter().map(|m| m.id.clone()).collect();
+        let ids: HashSet<_> = modified.id.into_iter().collect();
         assert_eq!(
             ids,
             HashSet::from(["child-a".to_string(), "child-c".to_string()])

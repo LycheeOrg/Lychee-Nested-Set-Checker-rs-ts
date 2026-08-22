@@ -14,10 +14,19 @@ Lychee stores album trees as `_lft`/`_rgt` pairs. This package validates such a 
 `_lft`/`_rgt` ordering) and provides the four MPTT repair operations used to fix it, all
 running as compiled Wasm instead of re-walking the array in JS on every keystroke.
 
+**v2** switched the API from array-of-structs to struct-of-arrays: a tree is one object
+holding parallel `id`/`title`/`parent_id`/`_lft`/`_rgt` arrays instead of an array of
+per-row objects, and `_lft`/`_rgt` cross the Wasm boundary as a real `Int32Array` (per-row
+boolean flags as `Uint8Array`) instead of a JS array of boxed values. `_lft`/`_rgt` are
+non-nullable; `0` is the "missing/invalid" sentinel.
+
 ## Why
 
 - **Fast on large trees.** The duplicate-detection pass and the parent-stack walk are
   both O(n); running them as Wasm keeps large album trees (thousands of rows) responsive while editing.
+- **Struct-of-arrays, typed arrays at the boundary.** `_lft`/`_rgt` move as a single
+  `Int32Array` copy instead of one boxed JS number per row, cutting allocation and
+  marshalling overhead on large trees.
 - **Decisions only, no rendering.** This crate returns structured results — which rows
   are duplicates, which error case applies, which rows changed — and leaves Vue
   reactivity, i18n string lookup and toast notifications to the consuming app. See
@@ -44,18 +53,20 @@ import init, { prepareAlbums } from "@lychee-org/nested-set-checker-wasm";
 
 await init(); // fetches and instantiates the .wasm file once
 
-const result = prepareAlbums([
-	{ id: "root-id", title: "Root", parent_id: null, _lft: 1, _rgt: 6 },
-	{ id: "child-a-id", title: "Child A", parent_id: "root-id", _lft: 2, _rgt: 3 },
-	{ id: "child-b-id", title: "Child B", parent_id: "root-id", _lft: 4, _rgt: 5 },
-]);
+const result = prepareAlbums({
+	id: ["root-id", "child-a-id", "child-b-id"],
+	title: ["Root", "Child A", "Child B"],
+	parent_id: [null, "root-id", "root-id"],
+	_lft: Int32Array.from([1, 2, 4]),
+	_rgt: Int32Array.from([6, 3, 5]),
+});
 
 console.log(result.isValid); // true
-console.log(result.albums[1].prefix); // "  │ " — indentation for display
+console.log(result.albums.prefix[1]); // "  │ " — indentation for display
 ```
 
-`source` must already be sorted by `_lft` (same precondition as the original TS
-composable).
+`source`'s arrays must all be the same length and already sorted by `_lft` (same
+precondition as the original TS composable).
 
 ### Node.js
 
@@ -76,28 +87,33 @@ await init({ module_or_path: wasmBytes });
 Full definitions (including every field) are shipped in the package's `.d.ts`.
 
 ```ts
-function prepareAlbums(source: AlbumTree[]): PrepareResult;
-function incrementLft(albums: AugmentedAlbum[], id: string): AugmentedAlbum[];
-function incrementRgt(albums: AugmentedAlbum[], id: string): AugmentedAlbum[];
-function decrementLft(albums: AugmentedAlbum[], id: string): AugmentedAlbum[];
-function decrementRgt(albums: AugmentedAlbum[], id: string): AugmentedAlbum[];
-function getModifiedAlbums(current: AlbumTree[], original: AlbumTree[]): ModifiedAlbum[];
+function prepareAlbums(source: AlbumTree): PrepareResult;
+function incrementLft(albums: AugmentedAlbumTree, id: string): AugmentedAlbumTree;
+function incrementRgt(albums: AugmentedAlbumTree, id: string): AugmentedAlbumTree;
+function decrementLft(albums: AugmentedAlbumTree, id: string): AugmentedAlbumTree;
+function decrementRgt(albums: AugmentedAlbumTree, id: string): AugmentedAlbumTree;
+function getModifiedAlbums(current: AlbumTree, original: AlbumTree): ModifiedAlbums;
 ```
 
 | Function             | Purpose                                                                                                    |
 | --------------------- | ------------------------------------------------------------------------------------------------------------ |
 | `prepareAlbums`       | Validates a tree: builds duplicate `_lft`/`_rgt` sets, walks it tracking a parent stack, classifies errors. |
-| `incrementLft`        | Shifts every album whose `_lft >= id`'s `_lft` up by one, making room to insert before it.                   |
-| `incrementRgt`        | Shifts every album whose `_rgt >= id`'s `_rgt` up by one, making room to insert after/inside it.              |
+| `incrementLft`        | Shifts every row whose `_lft >= id`'s `_lft` up by one, making room to insert before it.                     |
+| `incrementRgt`        | Shifts every row whose `_rgt >= id`'s `_rgt` up by one, making room to insert after/inside it.               |
 | `decrementLft`        | Inverse of `incrementLft`.                                                                                    |
 | `decrementRgt`        | Inverse of `incrementRgt`, with a safety check against collapsing a still-nonempty node.                     |
 | `getModifiedAlbums`   | Diffs `current` against `original` by id, returning only the rows that actually changed (or are new).        |
+
+`AlbumTree` is struct-of-arrays: `id`/`title`/`parent_id` are plain JS arrays, `_lft`/`_rgt`
+are `Int32Array`s, and every array must be the same length. `AugmentedAlbumTree` is
+`AlbumTree` plus `prefix`/`trimmedId`/`trimmedParentId` (string arrays) and
+`isDuplicate_rgt`/`isDuplicate_lft`/`isExpectedParentId` (`Uint8Array`s of `0`/`1`).
 
 `PrepareResult`:
 
 | Field     | Type                | Description                                                        |
 | --------- | ------------------- | -------------------------------------------------------------------- |
-| `albums`  | `AugmentedAlbum[]`  | Input rows augmented with display prefix, trimmed ids, and per-row flags. |
+| `albums`  | `AugmentedAlbumTree` | Input tree augmented with display prefix, trimmed ids, and per-row flags. |
 | `errors`  | `ErrorDescriptor[]` | One entry per row that failed validation, with enough data to build a translated message. |
 | `isValid` | `boolean`           | `errors.length === 0`.                                             |
 
