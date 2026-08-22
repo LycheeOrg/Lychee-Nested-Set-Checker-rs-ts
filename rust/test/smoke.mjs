@@ -5,8 +5,8 @@
 //
 // This is a plain Node script rather than a `cargo test`/`wasm-bindgen-test`
 // because it exists to catch integration bugs in the *published* JS/wasm glue
-// (module loading, JSON round-tripping across the wasm boundary), not to
-// re-test the tree-checking logic itself, which is covered by `cargo test`.
+// (module loading, typed-array round-tripping across the wasm boundary), not
+// to re-test the tree-checking logic itself, which is covered by `cargo test`.
 
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -25,38 +25,41 @@ const wasmBytes = await readFile(new URL('../pkg/nested_set_checker_wasm_bg.wasm
 await init({ module_or_path: wasmBytes });
 setPanicHook();
 
-const album = (id, parent_id, _lft, _rgt) => ({ id, title: id, parent_id, _lft, _rgt });
+// root(1,6) -> child-a(2,3), child-b(4,5)
+const validTree = () => ({
+	id: ['root', 'child-a', 'child-b'],
+	title: ['root', 'child-a', 'child-b'],
+	parent_id: [null, 'root', 'root'],
+	lft: Int32Array.from([1, 2, 4]),
+	rgt: Int32Array.from([6, 3, 5]),
+});
 
-const validTree = () => [
-	album('root', null, 1, 6),
-	album('child-a', 'root', 2, 3),
-	album('child-b', 'root', 4, 5),
-];
+const indexOf = (tree, id) => tree.id.indexOf(id);
 
 // A valid tree round-trips with no errors and correct prefixes.
 {
 	const result = prepareAlbums(validTree());
 	assert.equal(result.isValid, true);
 	assert.equal(result.errors.length, 0);
-	assert.equal(result.albums[0].prefix, '');
-	assert.equal(result.albums[1].prefix, '  │ ');
-	assert.equal(result.albums[0].trimmedId, 'root');
+	assert.equal(result.albums.prefix[0], '');
+	assert.equal(result.albums.prefix[1], '  │ ');
+	assert.equal(result.albums.trimmedId[0], 'root');
 }
 
-// Duplicate _lft is detected and classified.
+// Duplicate lft is detected and classified.
 {
 	const tree = validTree();
-	tree[2]._lft = 2; // collides with child-a's _lft
+	tree.lft[2] = 2; // collides with child-a's lft
 	const result = prepareAlbums(tree);
 	assert.equal(result.isValid, false);
 	assert.ok(result.errors.some((e) => e.kind === 'duplicate_left' || e.kind === 'duplicate_right'));
 }
 
-// null/0 _lft or _rgt is detected.
+// 0 lft or rgt is detected (the "missing" sentinel).
 {
 	const tree = validTree();
-	tree[1]._lft = null;
-	tree[2]._rgt = 0;
+	tree.lft[1] = 0;
+	tree.rgt[2] = 0;
 	const result = prepareAlbums(tree);
 	const kinds = result.errors.map((e) => e.kind);
 	assert.ok(kinds.includes('invalid_left'));
@@ -66,22 +69,21 @@ const validTree = () => [
 // An unexpected parent_id is detected.
 {
 	const tree = validTree();
-	tree[1].parent_id = 'someone-else';
+	tree.parent_id[1] = 'someone-else';
 	const result = prepareAlbums(tree);
 	assert.ok(result.errors.some((e) => e.kind === 'parent'));
 }
 
-// incrementLft shifts only rows whose _lft is >= the target's _lft; root's
-// _lft (1) is below the threshold (4), so it's untouched even though its
-// _rgt (6) is not.
+// incrementLft shifts only rows whose lft is >= the target's lft; root's
+// lft (1) is below the threshold (4), so it's untouched even though its
+// rgt (6) is not.
 {
 	const { albums } = prepareAlbums(validTree());
 	const shifted = incrementLft(albums, 'child-b');
-	const byId = Object.fromEntries(shifted.map((a) => [a.id, a]));
-	assert.equal(byId.root._lft, 1);
-	assert.equal(byId.root._rgt, 6);
-	assert.equal(byId['child-b']._lft, 5);
-	assert.equal(byId['child-b']._rgt, 6);
+	assert.equal(shifted.lft[indexOf(shifted, 'root')], 1);
+	assert.equal(shifted.rgt[indexOf(shifted, 'root')], 6);
+	assert.equal(shifted.lft[indexOf(shifted, 'child-b')], 5);
+	assert.equal(shifted.rgt[indexOf(shifted, 'child-b')], 6);
 }
 
 // decrementLft is the inverse of incrementLft.
@@ -89,45 +91,45 @@ const validTree = () => [
 	const { albums } = prepareAlbums(validTree());
 	const shifted = incrementLft(albums, 'child-b');
 	const restored = decrementLft(shifted, 'child-b');
-	const byId = Object.fromEntries(restored.map((a) => [a.id, a]));
-	assert.equal(byId.root._lft, 1);
-	assert.equal(byId.root._rgt, 6);
-	assert.equal(byId['child-b']._lft, 4);
-	assert.equal(byId['child-b']._rgt, 5);
+	assert.equal(restored.lft[indexOf(restored, 'root')], 1);
+	assert.equal(restored.rgt[indexOf(restored, 'root')], 6);
+	assert.equal(restored.lft[indexOf(restored, 'child-b')], 4);
+	assert.equal(restored.rgt[indexOf(restored, 'child-b')], 5);
 }
 
 // incrementRgt / decrementRgt round-trip through the boundary case.
 {
 	const { albums } = prepareAlbums(validTree());
 	const widened = incrementRgt(albums, 'child-a');
-	const byId = Object.fromEntries(widened.map((a) => [a.id, a]));
-	assert.equal(byId['child-a']._lft, 2);
-	assert.equal(byId['child-a']._rgt, 4);
-	assert.equal(byId.root._rgt, 7);
+	assert.equal(widened.lft[indexOf(widened, 'child-a')], 2);
+	assert.equal(widened.rgt[indexOf(widened, 'child-a')], 4);
+	assert.equal(widened.rgt[indexOf(widened, 'root')], 7);
 }
 
-// An id that doesn't exist leaves the array untouched rather than throwing.
+// An id that doesn't exist leaves the arrays untouched rather than throwing.
 {
 	const { albums } = prepareAlbums(validTree());
 	assert.doesNotThrow(() => incrementLft(albums, 'does-not-exist'));
 	const untouched = incrementLft(albums, 'does-not-exist');
-	assert.deepEqual(
-		untouched.map((a) => [a._lft, a._rgt]),
-		albums.map((a) => [a._lft, a._rgt]),
-	);
+	assert.deepEqual(Array.from(untouched.lft), Array.from(albums.lft));
+	assert.deepEqual(Array.from(untouched.rgt), Array.from(albums.rgt));
 }
 
-// getModifiedAlbums reports only rows whose _lft/_rgt/parent_id changed, plus
+// getModifiedAlbums reports only rows whose lft/rgt/parent_id changed, plus
 // any row that's new.
 {
 	const original = validTree();
 	const current = validTree();
-	current[1]._lft = 20;
-	current[1]._rgt = 21;
-	current.push(album('child-c', 'root', 30, 31));
+	current.lft[1] = 20;
+	current.rgt[1] = 21;
+	current.id = [...current.id, 'child-c'];
+	current.title = [...current.title, 'child-c'];
+	current.parent_id = [...current.parent_id, 'root'];
+	current.lft = Int32Array.from([...current.lft, 30]);
+	current.rgt = Int32Array.from([...current.rgt, 31]);
 
 	const modified = getModifiedAlbums(current, original);
-	const ids = modified.map((m) => m.id).sort();
+	const ids = Array.from(modified.id).sort();
 	assert.deepEqual(ids, ['child-a', 'child-c']);
 }
 

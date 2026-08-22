@@ -14,9 +14,13 @@ A clear and concise description of what's wrong.
 import init, { prepareAlbums } from "@lychee-org/nested-set-checker-wasm";
 
 await init();
-const result = prepareAlbums([
-	{ id: "...", title: "...", parent_id: null, _lft: 1, _rgt: 2 },
-]);
+const result = prepareAlbums({
+	id: ["..."],
+	title: ["..."],
+	parent_id: [null],
+	lft: Int32Array.from([1]),
+	rgt: Int32Array.from([2]),
+});
 ```
 What did you expect `result` to look like, and what did you actually get?
 
